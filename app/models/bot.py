@@ -22,6 +22,7 @@ class BotSession(Base):
     # active | paused | halted | deactivated | error
     status = Column(String(32), nullable=False, default="active")
     entry_price = Column(_MONEY, nullable=True)
+    entry_quantity = Column(_MONEY, nullable=True)
     position_side = Column(String(8), nullable=True)  # BUY | SELL
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))
     updated_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(UTC))

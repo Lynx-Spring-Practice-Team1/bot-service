@@ -81,6 +81,18 @@ class BrokerClient:
             params={"event_type": "HALT", "target": symbol, "limit": limit},
         )
 
+    async def get_market_events(self, limit: int = 10) -> list[dict]:
+        """Fetch recent market events of all types.
+
+        Returns unfiltered so the caller can exclude PRICE_FEED / HALT.
+        A higher default limit gives the cache enough events to find the
+        most recent non-price, non-halt entry.
+        """
+        return await self._request(
+            "GET", "/api/market/events",
+            params={"limit": limit},
+        )
+
     async def get_orderbook(self, symbol: str) -> dict:
         return await self._request("GET", f"/api/market/stocks/{symbol}/orderbook")
 
@@ -103,18 +115,18 @@ class BrokerClient:
         side: str,
         order_type: str,
         quantity: float,
-        price: float,
+        price: float | None = None,
     ) -> dict:
-        return await self._request(
-            "POST", "/api/orders",
-            json={
-                "symbol": symbol,
-                "side": side,
-                "order_type": order_type,
-                "quantity": quantity,
-                "price": price,
-            },
-        )
+        # order-service expects quantity as int (OrderCreate schema)
+        payload: dict = {
+            "symbol": symbol,
+            "side": side,
+            "order_type": order_type,
+            "quantity": max(1, int(quantity)),
+        }
+        if price is not None:
+            payload["price"] = price
+        return await self._request("POST", "/api/orders", json=payload)
 
     async def get_orders(self) -> list[dict]:
         return await self._request("GET", "/api/orders")

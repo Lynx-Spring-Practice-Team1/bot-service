@@ -10,12 +10,13 @@ from __future__ import annotations
 from decimal import ROUND_DOWN, Decimal
 
 DEFAULT_MAX_OPEN_ORDERS: int = 3
-DEFAULT_STOP_LOSS_PCT: float = 0.02   # 2 %
+DEFAULT_STOP_LOSS_PCT: float = 0.02    # 2 %
 DEFAULT_MAX_BALANCE_PCT: float = 0.20  # 20 %
+DEFAULT_DAILY_LOSS_LIMIT: float = 0.05 # 5 % of balance
+DEFAULT_MAX_DRAWDOWN: float = 0.10     # 10 % from peak
 
-_OPEN_STATUSES: frozenset[str] = frozenset(
-    {"open", "pending", "NEW", "PENDING", "OPEN", "submitted"}
-)
+# Matches OrderStatus enum in order-service/app/models.py
+_OPEN_STATUSES: frozenset[str] = frozenset({"PENDING", "ACCEPTED"})
 
 
 def can_place_order(orders: list[dict], max_open: int = DEFAULT_MAX_OPEN_ORDERS) -> bool:
@@ -36,6 +37,28 @@ def is_stop_loss_triggered(
     else:
         loss_pct = (current_price - entry_price) / entry_price
     return loss_pct >= stop_loss_pct
+
+
+def is_daily_loss_exceeded(
+    daily_pnl: float,
+    balance: float,
+    limit_pct: float = DEFAULT_DAILY_LOSS_LIMIT,
+) -> bool:
+    """Return True when today's realized losses exceed `limit_pct` of current balance."""
+    if balance <= 0:
+        return False
+    return (-daily_pnl / balance) >= limit_pct
+
+
+def is_max_drawdown_exceeded(
+    current_balance: float,
+    peak_balance: float,
+    max_drawdown_pct: float = DEFAULT_MAX_DRAWDOWN,
+) -> bool:
+    """Return True when balance has fallen `max_drawdown_pct` below its daily peak."""
+    if peak_balance <= 0:
+        return False
+    return (peak_balance - current_balance) / peak_balance >= max_drawdown_pct
 
 
 def compute_quantity(

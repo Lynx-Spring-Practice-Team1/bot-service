@@ -3,6 +3,8 @@ from contextlib import asynccontextmanager
 
 import jwt as pyjwt
 import sqlalchemy as sa
+from alembic import command
+from alembic.config import Config
 from fastapi import FastAPI
 from sqlalchemy import select
 
@@ -61,9 +63,16 @@ async def _restore_active_sessions() -> int:
         return restored
 
 
+def _run_migrations() -> None:
+    cfg = Config("alembic.ini")
+    command.upgrade(cfg, "head")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # ── startup ───────────────────────────────────────────────────────────────
+    _run_migrations()
+
     async with AsyncSessionLocal() as db:
         await db.execute(sa.text("SELECT 1"))  # warm connection pool
 
