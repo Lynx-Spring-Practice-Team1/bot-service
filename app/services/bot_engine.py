@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, UTC
+from decimal import Decimal
 from uuid import UUID
 
 from app.database import AsyncSessionLocal
 from app.models.bot import BotSession, BotTrade
 from app.services import bot_manager, risk_manager
 from app.services.broker_client import BrokerAPIError, BrokerClient
+from app.services.crypto import InvalidToken, decrypt_token
 from app.services.market_data import price_cache
 from app.services.strategy import detect_crossover, orderbook_bias
 
@@ -66,10 +68,11 @@ async def _close_position(
             price=current_price,
         )
         if session.entry_price and session.position_side:
-            pnl = (
-                (current_price - session.entry_price) * qty
-                if session.position_side == "BUY"
-                else (session.entry_price - current_price) * qty
+            entry = Decimal(str(session.entry_price))
+            cur = Decimal(str(current_price))
+            q = Decimal(str(qty))
+            pnl = float(
+                (cur - entry) * q if session.position_side == "BUY" else (entry - cur) * q
             )
         else:
             pnl = 0.0
@@ -116,7 +119,18 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                     await asyncio.sleep(TICK_INTERVAL)
                     continue
 
-                client = BrokerClient(session.jwt_token)
+                try:
+                    raw_token = decrypt_token(session.jwt_token)
+                except InvalidToken:
+                    logger.error(
+                        "Cannot decrypt JWT for session %s (secret rotated?) – marking error",
+                        session_id,
+                    )
+                    session.status = "error"
+                    await db.commit()
+                    return
+
+                client = BrokerClient(raw_token)
                 symbol = session.symbol
                 p = _read_config(session.strategy_config or {})
 

@@ -7,6 +7,8 @@ passes them in; the constants here are the defaults only.
 
 from __future__ import annotations
 
+from decimal import ROUND_DOWN, Decimal
+
 DEFAULT_MAX_OPEN_ORDERS: int = 3
 DEFAULT_STOP_LOSS_PCT: float = 0.02   # 2 %
 DEFAULT_MAX_BALANCE_PCT: float = 0.20  # 20 %
@@ -28,7 +30,7 @@ def is_stop_loss_triggered(
     position_side: str,
     stop_loss_pct: float = DEFAULT_STOP_LOSS_PCT,
 ) -> bool:
-    """Return True when the unrealised loss on the current position exceeds the threshold."""
+    """Return True when the unrealised loss exceeds the threshold."""
     if position_side == "BUY":
         loss_pct = (entry_price - current_price) / entry_price
     else:
@@ -41,8 +43,19 @@ def compute_quantity(
     price: float,
     max_balance_pct: float = DEFAULT_MAX_BALANCE_PCT,
 ) -> float:
-    """Return the maximum order quantity within the balance cap, or 0 if insufficient funds."""
-    if available_cash <= 0 or price <= 0:
+    """Return the maximum order quantity within the balance cap.
+
+    Uses Decimal arithmetic to avoid IEEE-754 rounding errors that would
+    accumulate across high-frequency order sizing calculations (L-01).
+    Always rounds down (never over-spends the cap).
+    """
+    avail = Decimal(str(available_cash))
+    p = Decimal(str(price))
+    pct = Decimal(str(max_balance_pct))
+
+    if avail <= 0 or p <= 0:
         return 0.0
-    max_spend = available_cash * max_balance_pct
-    return round(max_spend / price, 2)
+
+    max_spend = avail * pct
+    qty = (max_spend / p).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    return float(qty)

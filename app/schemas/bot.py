@@ -6,7 +6,8 @@ from pydantic import BaseModel, field_validator
 
 
 class ActivateRequest(BaseModel):
-    jwt_token: str
+    # jwt_token intentionally absent — the bot reads the caller's Bearer token
+    # from the Authorization header so it never travels in the request body.
     symbol: str
     strategy_config: dict[str, Any] = {}
 
@@ -14,8 +15,8 @@ class ActivateRequest(BaseModel):
 class ConfigUpdate(BaseModel):
     symbol: Optional[str] = None
     strategy_config: Optional[dict[str, Any]] = None
-    # User-controllable statuses only.  'halted' and 'error' are system-set;
-    # setting status='active' here also serves as a manual halt-override.
+    # User-settable values only.  'halted' and 'error' are system-set;
+    # posting status='active' also serves as a manual halt-override.
     status: Optional[str] = None
 
     @field_validator("status")

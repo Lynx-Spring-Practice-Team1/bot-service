@@ -6,4 +6,6 @@ alembic==1.14.0
 httpx==0.28.0
 pydantic==2.10.3
 pydantic-settings==2.6.1
+cryptography==44.0.0
+PyJWT==2.10.1
 greenlet==3.1.1
