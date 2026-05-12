@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 TICK_INTERVAL = 1.0  # seconds
 
+# Statuses that mean the broker rejected the order and it will never fill.
+_REJECTED_STATUSES: frozenset[str] = frozenset(
+    {"REJECTED", "CANCELLED", "CANCELED", "FAILED", "EXPIRED", "DENIED"}
+)
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -231,6 +236,20 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                     await asyncio.sleep(TICK_INTERVAL)
                     continue
 
+                # Validate that the broker actually accepted the order.
+                # Some brokers return 200 with status=REJECTED on validation
+                # failures (insufficient margin, price bands, etc.).
+                order_status = str(order.get("status", "")).upper()
+                if order_status in _REJECTED_STATUSES:
+                    logger.warning(
+                        "Order rejected by broker  user=%s  symbol=%s  "
+                        "broker_status=%s  reason=%s",
+                        user_id, symbol, order_status,
+                        order.get("message") or order.get("reason", "unknown"),
+                    )
+                    await asyncio.sleep(TICK_INTERVAL)
+                    continue
+
                 db.add(
                     BotTrade(
                         session_id=session.id,
@@ -249,8 +268,8 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                 await db.commit()
 
                 logger.info(
-                    "Placed %s LIMIT  user=%s  symbol=%s  qty=%.2f  price=%.4f",
-                    side, user_id, symbol, quantity, current_price,
+                    "Placed %s LIMIT  user=%s  symbol=%s  qty=%.2f  price=%.4f  broker_status=%s",
+                    side, user_id, symbol, quantity, current_price, order_status or "unknown",
                 )
 
         except asyncio.CancelledError:

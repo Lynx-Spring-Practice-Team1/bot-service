@@ -14,6 +14,7 @@ from app.schemas.bot import (
     ConfigUpdate,
     TradeOut,
 )
+from app.services import bot_manager
 from app.services.bot_engine import is_bot_running, start_bot, stop_bot
 from app.services.broker_client import BrokerAPIError, BrokerClient
 
@@ -39,42 +40,46 @@ async def activate(
 ):
     user_id = _require_user_id(request)
 
-    if is_bot_running(user_id):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Bot already active")
+    # Acquire the per-user lock before the is_running check so that two
+    # concurrent activate requests for the same user cannot both pass the
+    # guard and spawn duplicate tasks.
+    async with bot_manager.get_activation_lock(user_id):
+        if is_bot_running(user_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Bot already active")
 
-    # validate JWT against the broker before persisting it
-    client = BrokerClient(payload.jwt_token)
-    try:
-        await client.get_balance()
-    except BrokerAPIError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"JWT validation failed: {exc.detail}",
+        # validate JWT against the broker before persisting it
+        client = BrokerClient(payload.jwt_token)
+        try:
+            await client.get_balance()
+        except BrokerAPIError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"JWT validation failed: {exc.detail}",
+            )
+
+        # deactivate any previous sessions for this user
+        stmt = select(BotSession).where(
+            BotSession.user_id == user_id,
+            BotSession.status != "deactivated",
         )
+        for old in (await db.execute(stmt)).scalars().all():
+            old.status = "deactivated"
 
-    # deactivate any previous sessions for this user
-    stmt = select(BotSession).where(
-        BotSession.user_id == user_id,
-        BotSession.status != "deactivated",
-    )
-    for old in (await db.execute(stmt)).scalars().all():
-        old.status = "deactivated"
+        session = BotSession(
+            id=uuid4(),
+            user_id=user_id,
+            jwt_token=payload.jwt_token,
+            symbol=payload.symbol.upper(),
+            strategy_config=payload.strategy_config,
+            status="active",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        db.add(session)
+        await db.commit()
+        await db.refresh(session)
 
-    session = BotSession(
-        id=uuid4(),
-        user_id=user_id,
-        jwt_token=payload.jwt_token,
-        symbol=payload.symbol.upper(),
-        strategy_config=payload.strategy_config,
-        status="active",
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
-    )
-    db.add(session)
-    await db.commit()
-    await db.refresh(session)
-
-    start_bot(session.id, user_id)
+        start_bot(session.id, user_id)
 
     return {"session_id": str(session.id), "status": "active", "symbol": session.symbol}
 
