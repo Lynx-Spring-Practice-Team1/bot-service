@@ -14,6 +14,8 @@ class ActivateRequest(BaseModel):
 class ConfigUpdate(BaseModel):
     symbol: Optional[str] = None
     strategy_config: Optional[dict[str, Any]] = None
+    # User-controllable statuses only.  'halted' and 'error' are system-set;
+    # setting status='active' here also serves as a manual halt-override.
     status: Optional[str] = None
 
     @field_validator("status")
@@ -39,6 +41,7 @@ class TradeOut(BaseModel):
 
 class BotStatusOut(BaseModel):
     session_id: UUID
+    # active | paused | halted | error | deactivated
     status: str
     symbol: str
     entry_price: Optional[float]

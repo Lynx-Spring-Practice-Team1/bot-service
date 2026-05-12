@@ -17,7 +17,6 @@ def extract_prices(events: list[dict]) -> list[float]:
     """Pull price values from PRICE_FEED event objects.
 
     Tries several field layouts emitted by different exchange implementations.
-    Events are returned newest-last (ascending time) by the API.
     """
     prices: list[float] = []
     for ev in events:
@@ -34,11 +33,15 @@ def extract_prices(events: list[dict]) -> list[float]:
     return prices
 
 
-def detect_crossover(prices: list[float], fast: int = 5, slow: int = 20) -> str | None:
+def detect_crossover(
+    prices: list[float],
+    fast: int = 5,
+    slow: int = 20,
+) -> str | None:
     """Return 'bullish', 'bearish', or None.
 
-    Needs at least slow+2 data points so that we can compare the previous
-    and current EMA pairs and detect a genuine cross.
+    Requires at least slow+2 data points to detect a genuine cross between
+    the previous and current EMA pair.
     """
     if len(prices) < slow + 2:
         return None
@@ -58,7 +61,11 @@ def detect_crossover(prices: list[float], fast: int = 5, slow: int = 20) -> str 
     return None
 
 
-def orderbook_bias(orderbook: dict) -> str | None:
+def orderbook_bias(
+    orderbook: dict,
+    bullish_threshold: float = 0.6,
+    bearish_threshold: float = 0.4,
+) -> str | None:
     """Return 'bullish' (bid-heavy), 'bearish' (ask-heavy), or None (neutral)."""
     bids: list[dict] = orderbook.get("bids", [])
     asks: list[dict] = orderbook.get("asks", [])
@@ -71,8 +78,8 @@ def orderbook_bias(orderbook: dict) -> str | None:
         return None
 
     ratio = bid_vol / total
-    if ratio > 0.6:
+    if ratio > bullish_threshold:
         return "bullish"
-    if ratio < 0.4:
+    if ratio < bearish_threshold:
         return "bearish"
     return None

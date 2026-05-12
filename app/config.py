@@ -4,7 +4,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     DATABASE_URL: str
     BROKER_API_URL: str = "http://api-gateway:8080"
-    JWT_SECRET: str = "changeme"
+    JWT_SECRET: str  # no default — must be set in the environment
 
     model_config = {"env_file": ".env"}
 

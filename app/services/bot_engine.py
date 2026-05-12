@@ -1,8 +1,8 @@
-"""Asyncio-based bot engine.
+"""Bot tick loop.
 
-One asyncio.Task runs per active user session.  Each task ticks every second,
-fetches market data, evaluates the EMA-crossover + order-book strategy, and
-places LIMIT orders when a confirmed signal fires, respecting all risk rules.
+Each active session gets one asyncio.Task (managed by bot_manager).
+Risk rules live in risk_manager; market data fetching/caching in market_data;
+strategy signal logic in strategy.
 """
 
 from __future__ import annotations
@@ -14,31 +14,33 @@ from uuid import UUID
 
 from app.database import AsyncSessionLocal
 from app.models.bot import BotSession, BotTrade
+from app.services import bot_manager, risk_manager
 from app.services.broker_client import BrokerAPIError, BrokerClient
-from app.services.strategy import detect_crossover, extract_prices, orderbook_bias
+from app.services.market_data import price_cache
+from app.services.strategy import detect_crossover, orderbook_bias
 
 logger = logging.getLogger(__name__)
 
-# ── risk constants ────────────────────────────────────────────────────────────
-FAST_PERIOD = 5
-SLOW_PERIOD = 20
-MAX_BOT_OPEN_ORDERS = 3
-STOP_LOSS_PCT = 0.02      # 2 %
-MAX_BALANCE_PCT = 0.20    # 20 % of available balance per order
-TICK_INTERVAL = 1.0       # seconds
-
-# ── global task registry  user_id → Task ──────────────────────────────────────
-_tasks: dict[str, asyncio.Task] = {}
+TICK_INTERVAL = 1.0  # seconds
 
 
-# ── internal helpers ──────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def _order_id(order: dict) -> str:
     return str(order.get("id") or order.get("order_id") or order.get("orderId") or "")
 
 
-def _open_order_statuses() -> set[str]:
-    return {"open", "pending", "NEW", "PENDING", "OPEN", "submitted"}
+def _read_config(cfg: dict) -> dict:
+    """Extract strategy params from session.strategy_config with safe defaults."""
+    return {
+        "fast_period": int(cfg.get("fast_period", 5)),
+        "slow_period": int(cfg.get("slow_period", 20)),
+        "ob_bullish": float(cfg.get("ob_bullish_threshold", 0.6)),
+        "ob_bearish": float(cfg.get("ob_bearish_threshold", 0.4)),
+        "stop_loss_pct": float(cfg.get("stop_loss_pct", risk_manager.DEFAULT_STOP_LOSS_PCT)),
+        "max_balance_pct": float(cfg.get("max_balance_pct", risk_manager.DEFAULT_MAX_BALANCE_PCT)),
+        "max_open_orders": int(cfg.get("max_open_orders", risk_manager.DEFAULT_MAX_OPEN_ORDERS)),
+    }
 
 
 async def _close_position(
@@ -48,9 +50,8 @@ async def _close_position(
     db,
     reason: str,
 ) -> None:
-    """Place the opposite side order to close the current position."""
     close_side = "SELL" if session.position_side == "BUY" else "BUY"
-    qty = 1.0  # minimal close – real sizing would need portfolio data
+    qty = 1.0
     try:
         order = await client.place_order(
             symbol=session.symbol,
@@ -60,35 +61,39 @@ async def _close_position(
             price=current_price,
         )
         if session.entry_price and session.position_side:
-            if session.position_side == "BUY":
-                pnl = (current_price - session.entry_price) * qty
-            else:
-                pnl = (session.entry_price - current_price) * qty
+            pnl = (
+                (current_price - session.entry_price) * qty
+                if session.position_side == "BUY"
+                else (session.entry_price - current_price) * qty
+            )
         else:
             pnl = 0.0
 
-        trade = BotTrade(
-            session_id=session.id,
-            user_id=session.user_id,
-            broker_order_id=_order_id(order),
-            symbol=session.symbol,
-            side=close_side,
-            quantity=qty,
-            price=current_price,
-            status="open",
-            pnl=pnl,
+        db.add(
+            BotTrade(
+                session_id=session.id,
+                user_id=session.user_id,
+                broker_order_id=_order_id(order),
+                symbol=session.symbol,
+                side=close_side,
+                quantity=qty,
+                price=current_price,
+                status="open",
+                pnl=pnl,
+            )
         )
-        db.add(trade)
         session.entry_price = None
         session.position_side = None
         session.updated_at = datetime.now(UTC)
         logger.info(
-            "Closed position (%s) for user=%s symbol=%s at %.4f pnl=%.4f",
+            "Closed position (%s)  user=%s  symbol=%s  price=%.4f  pnl=%.4f",
             reason, session.user_id, session.symbol, current_price, pnl,
         )
     except BrokerAPIError as exc:
         logger.error("Failed to close position: %s", exc)
 
+
+# ── main tick coroutine ───────────────────────────────────────────────────────
 
 async def _bot_tick(session_id: UUID, user_id: str) -> None:
     logger.info("Bot started  user=%s  session=%s", user_id, session_id)
@@ -98,8 +103,8 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
             async with AsyncSessionLocal() as db:
                 session: BotSession | None = await db.get(BotSession, session_id)
 
-                if session is None or session.status == "deactivated":
-                    logger.info("Session %s deactivated – exiting task", session_id)
+                if session is None or session.status in ("deactivated", "error"):
+                    logger.info("Session %s inactive – exiting task", session_id)
                     return
 
                 if session.status == "paused":
@@ -108,11 +113,12 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
 
                 client = BrokerClient(session.jwt_token)
                 symbol = session.symbol
+                p = _read_config(session.strategy_config or {})
 
-                # ── 1. check for HALT events ──────────────────────────────
+                # ── 1. HALT check ─────────────────────────────────────────
                 try:
-                    halt_events = await client.get_halt_events(symbol, limit=5)
-                    if halt_events:
+                    halted = await price_cache.is_halted(client, symbol)
+                    if halted:
                         if session.status != "halted":
                             session.status = "halted"
                             session.updated_at = datetime.now(UTC)
@@ -127,59 +133,58 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                         logger.info("HALT cleared for %s – bot resuming", symbol)
                 except BrokerAPIError as exc:
                     if exc.status_code == 401:
-                        logger.error("JWT expired for user=%s – deactivating bot", user_id)
-                        session.status = "deactivated"
+                        logger.error("JWT rejected for user=%s – marking session error", user_id)
+                        session.status = "error"
                         await db.commit()
                         return
-                    logger.warning("Could not fetch halt events: %s", exc)
+                    logger.warning("Halt check failed: %s", exc)
 
-                # ── 2. fetch price history ────────────────────────────────
+                # ── 2. Price history ──────────────────────────────────────
                 try:
-                    price_events = await client.get_price_events(symbol, limit=30)
+                    prices = await price_cache.get_prices(client, symbol, limit=30)
                 except BrokerAPIError as exc:
                     if exc.status_code == 401:
-                        session.status = "deactivated"
+                        session.status = "error"
                         await db.commit()
                         return
                     logger.error("Price fetch failed: %s", exc)
                     await asyncio.sleep(TICK_INTERVAL)
                     continue
 
-                prices = extract_prices(price_events)
-                if len(prices) < SLOW_PERIOD + 2:
+                if len(prices) < p["slow_period"] + 2:
                     await asyncio.sleep(TICK_INTERVAL)
                     continue
 
                 current_price = prices[-1]
 
-                # ── 3. stop-loss check ────────────────────────────────────
+                # ── 3. Stop-loss ──────────────────────────────────────────
                 if session.entry_price and session.position_side:
-                    entry = session.entry_price
-                    if session.position_side == "BUY":
-                        loss_pct = (entry - current_price) / entry
-                    else:
-                        loss_pct = (current_price - entry) / entry
-
-                    if loss_pct >= STOP_LOSS_PCT:
+                    if risk_manager.is_stop_loss_triggered(
+                        session.entry_price, current_price,
+                        session.position_side, p["stop_loss_pct"],
+                    ):
                         logger.warning(
-                            "Stop-loss triggered for user=%s symbol=%s loss=%.2f%%",
-                            user_id, symbol, loss_pct * 100,
+                            "Stop-loss triggered  user=%s  symbol=%s", user_id, symbol
                         )
                         await _close_position(client, session, current_price, db, "stop-loss")
                         await db.commit()
                         await asyncio.sleep(TICK_INTERVAL)
                         continue
 
-                # ── 4. EMA crossover signal ───────────────────────────────
-                signal = detect_crossover(prices, fast=FAST_PERIOD, slow=SLOW_PERIOD)
+                # ── 4. EMA crossover ──────────────────────────────────────
+                signal = detect_crossover(prices, fast=p["fast_period"], slow=p["slow_period"])
                 if not signal:
                     await asyncio.sleep(TICK_INTERVAL)
                     continue
 
-                # ── 5. order-book confirmation ────────────────────────────
+                # ── 5. Order-book confirmation ────────────────────────────
                 try:
-                    orderbook = await client.get_orderbook(symbol)
-                    bias = orderbook_bias(orderbook)
+                    book = await client.get_orderbook(symbol)
+                    bias = orderbook_bias(
+                        book,
+                        bullish_threshold=p["ob_bullish"],
+                        bearish_threshold=p["ob_bearish"],
+                    )
                 except BrokerAPIError as exc:
                     logger.error("Orderbook fetch failed: %s", exc)
                     await asyncio.sleep(TICK_INTERVAL)
@@ -189,7 +194,7 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                     await asyncio.sleep(TICK_INTERVAL)
                     continue
 
-                # ── 6. risk: max open bot orders ──────────────────────────
+                # ── 6. Max open orders ────────────────────────────────────
                 try:
                     all_orders = await client.get_orders()
                 except BrokerAPIError as exc:
@@ -197,15 +202,12 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                     await asyncio.sleep(TICK_INTERVAL)
                     continue
 
-                open_count = sum(
-                    1 for o in all_orders if o.get("status") in _open_order_statuses()
-                )
-                if open_count >= MAX_BOT_OPEN_ORDERS:
-                    logger.debug("Max open orders (%d) reached – skipping", MAX_BOT_OPEN_ORDERS)
+                if not risk_manager.can_place_order(all_orders, p["max_open_orders"]):
+                    logger.debug("Max open orders reached – skipping")
                     await asyncio.sleep(TICK_INTERVAL)
                     continue
 
-                # ── 7. risk: position sizing (max 20 % of available cash) ─
+                # ── 7. Position sizing ────────────────────────────────────
                 try:
                     balance = await client.get_balance()
                     available = float(balance.get("available", 0))
@@ -214,51 +216,40 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                     await asyncio.sleep(TICK_INTERVAL)
                     continue
 
-                max_spend = available * MAX_BALANCE_PCT
-                if max_spend <= 0 or current_price <= 0:
-                    await asyncio.sleep(TICK_INTERVAL)
-                    continue
-
-                quantity = round(max_spend / current_price, 2)
+                quantity = risk_manager.compute_quantity(available, current_price, p["max_balance_pct"])
                 if quantity <= 0:
                     logger.info("Insufficient balance for %s", symbol)
                     await asyncio.sleep(TICK_INTERVAL)
                     continue
 
-                # ── 8. place LIMIT order ──────────────────────────────────
+                # ── 8. Place LIMIT order ──────────────────────────────────
                 side = "BUY" if signal == "bullish" else "SELL"
                 try:
-                    order = await client.place_order(
-                        symbol=symbol,
-                        side=side,
-                        order_type="LIMIT",
-                        quantity=quantity,
-                        price=current_price,
-                    )
+                    order = await client.place_order(symbol, side, "LIMIT", quantity, current_price)
                 except BrokerAPIError as exc:
                     logger.error("Order placement failed: %s", exc)
                     await asyncio.sleep(TICK_INTERVAL)
                     continue
 
-                trade = BotTrade(
-                    session_id=session.id,
-                    user_id=user_id,
-                    broker_order_id=_order_id(order),
-                    symbol=symbol,
-                    side=side,
-                    quantity=quantity,
-                    price=current_price,
-                    status="open",
+                db.add(
+                    BotTrade(
+                        session_id=session.id,
+                        user_id=user_id,
+                        broker_order_id=_order_id(order),
+                        symbol=symbol,
+                        side=side,
+                        quantity=quantity,
+                        price=current_price,
+                        status="open",
+                    )
                 )
-                db.add(trade)
-
                 session.entry_price = current_price
                 session.position_side = side
                 session.updated_at = datetime.now(UTC)
                 await db.commit()
 
                 logger.info(
-                    "Placed %s LIMIT order  user=%s  symbol=%s  qty=%.2f  price=%.4f",
+                    "Placed %s LIMIT  user=%s  symbol=%s  qty=%.2f  price=%.4f",
                     side, user_id, symbol, quantity, current_price,
                 )
 
@@ -271,26 +262,19 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
         await asyncio.sleep(TICK_INTERVAL)
 
 
-# ── public API ────────────────────────────────────────────────────────────────
+# ── public API (used by routers and main) ─────────────────────────────────────
 
 def start_bot(session_id: UUID, user_id: str) -> asyncio.Task:
-    stop_bot(user_id)
-    task = asyncio.create_task(_bot_tick(session_id, user_id), name=f"bot-{user_id}")
-    _tasks[user_id] = task
-    return task
+    return bot_manager.start(session_id, user_id, _bot_tick)
 
 
 def stop_bot(user_id: str) -> None:
-    task = _tasks.pop(user_id, None)
-    if task and not task.done():
-        task.cancel()
+    bot_manager.stop(user_id)
 
 
 def is_bot_running(user_id: str) -> bool:
-    task = _tasks.get(user_id)
-    return task is not None and not task.done()
+    return bot_manager.is_running(user_id)
 
 
 def stop_all_bots() -> None:
-    for uid in list(_tasks.keys()):
-        stop_bot(uid)
+    bot_manager.stop_all()
