@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from uuid import UUID
@@ -38,6 +39,7 @@ from app.services.strategy import (
     ema_signal,
 )
 from app.services.strategy_selector import select_strategy
+from app.services.ws_feed import BotWebSocketFeed
 
 logger = logging.getLogger(__name__)
 
@@ -161,12 +163,37 @@ async def _cancel_orders(client: BrokerClient, order_ids: list[str]) -> None:
 # ── main tick coroutine ───────────────────────────────────────────────────────
 
 async def _bot_tick(session_id: UUID, user_id: str) -> None:
+    """Top-level entry: starts the WS feed then runs the tick loop."""
+    async with AsyncSessionLocal() as db:
+        session: BotSession | None = await db.get(BotSession, session_id)
+        if session is None:
+            return
+        try:
+            raw_token = decrypt_token(session.jwt_token)
+        except InvalidToken:
+            logger.error("Cannot decrypt JWT for session %s on startup – marking error", session_id)
+            session.status = "error"
+            await db.commit()
+            return
+
+    feed = BotWebSocketFeed(raw_token)
+    feed_task = asyncio.create_task(feed.run(), name=f"ws-feed-{user_id}")
+    try:
+        await _bot_loop(session_id, user_id, feed)
+    finally:
+        feed.stop()
+        with suppress(asyncio.CancelledError):
+            await feed_task
+
+
+async def _bot_loop(session_id: UUID, user_id: str, feed: BotWebSocketFeed) -> None:
     logger.info("Bot started  user=%s  session=%s", user_id, session_id)
 
     # In-memory per-task state (reset on task restart)
     mart_state = MartingaleState()
     grid_state = GridState()
     current_strategy: str = "hold"
+    symbol: str = ""  # guards end-of-loop wait before first DB load
 
     daily_pnl: float = 0.0
     peak_balance: float | None = None
@@ -181,8 +208,11 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                     logger.info("Session %s inactive – exiting task", session_id)
                     return
 
+                symbol = session.symbol
+                p = _read_config(session.strategy_config or {})
+
                 if session.status == "paused":
-                    await asyncio.sleep(TICK_INTERVAL)
+                    await feed.wait_for_price(symbol, timeout=TICK_INTERVAL)
                     continue
 
                 try:
@@ -197,8 +227,6 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                     return
 
                 client = BrokerClient(raw_token)
-                symbol = session.symbol
-                p = _read_config(session.strategy_config or {})
 
                 # ── 1. HALT check ─────────────────────────────────────────
                 try:
@@ -209,7 +237,7 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                             session.updated_at = datetime.now(UTC)
                             await db.commit()
                             logger.warning("HALT detected for %s – bot halted", symbol)
-                        await asyncio.sleep(TICK_INTERVAL)
+                        await feed.wait_for_price(symbol, timeout=TICK_INTERVAL)
                         continue
                     elif session.status == "halted":
                         session.status = "active"
@@ -225,19 +253,25 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                     logger.warning("Halt check failed: %s", exc)
 
                 # ── 2. Price history ──────────────────────────────────────
-                try:
-                    prices = await price_cache.get_prices(client, symbol, limit=30)
-                except BrokerAPIError as exc:
-                    if exc.status_code == 401:
-                        session.status = "error"
-                        await db.commit()
-                        return
-                    logger.error("Price fetch failed: %s", exc)
-                    await asyncio.sleep(TICK_INTERVAL)
-                    continue
+                ws_prices = feed.get_prices(symbol)
+                if len(ws_prices) >= p["slow_period"] + 2:
+                    prices = ws_prices
+                else:
+                    # WS buffer not ready yet — fall back to REST and seed feed
+                    try:
+                        prices = await price_cache.get_prices(client, symbol, limit=30)
+                        feed.inject_prices(symbol, prices)
+                    except BrokerAPIError as exc:
+                        if exc.status_code == 401:
+                            session.status = "error"
+                            await db.commit()
+                            return
+                        logger.error("Price fetch failed: %s", exc)
+                        await feed.wait_for_price(symbol, timeout=TICK_INTERVAL)
+                        continue
 
                 if len(prices) < p["slow_period"] + 2:
-                    await asyncio.sleep(TICK_INTERVAL)
+                    await feed.wait_for_price(symbol, timeout=TICK_INTERVAL)
                     continue
 
                 current_price = prices[-1]
@@ -272,7 +306,7 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                     total_balance = float(balance_info.get("balance", available))
                 except BrokerAPIError as exc:
                     logger.error("Balance fetch failed: %s", exc)
-                    await asyncio.sleep(TICK_INTERVAL)
+                    await feed.wait_for_price(symbol, timeout=TICK_INTERVAL)
                     continue
 
                 # ── 4. Daily tracker reset ────────────────────────────────
@@ -291,7 +325,7 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                         session.updated_at = datetime.now(UTC)
                         await db.commit()
                         logger.warning("Daily loss limit hit – pausing bot  user=%s", user_id)
-                    await asyncio.sleep(TICK_INTERVAL)
+                    await feed.wait_for_price(symbol, timeout=TICK_INTERVAL)
                     continue
 
                 if peak_balance is not None and risk_manager.is_max_drawdown_exceeded(
@@ -302,7 +336,7 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                         session.updated_at = datetime.now(UTC)
                         await db.commit()
                         logger.warning("Max drawdown hit – pausing bot  user=%s", user_id)
-                    await asyncio.sleep(TICK_INTERVAL)
+                    await feed.wait_for_price(symbol, timeout=TICK_INTERVAL)
                     continue
 
                 # ── 6. Build market state ─────────────────────────────────
@@ -366,7 +400,7 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                         pnl = await _close_position(client, session, current_price, db, "stop-loss", "MARKET")
                         daily_pnl += pnl
                         await db.commit()
-                        await asyncio.sleep(TICK_INTERVAL)
+                        await feed.wait_for_price(symbol, timeout=TICK_INTERVAL)
                         continue
 
                 # ── 9. Fetch open orders ──────────────────────────────────
@@ -374,8 +408,19 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
                     all_orders = await client.get_orders()
                 except BrokerAPIError as exc:
                     logger.error("Orders fetch failed: %s", exc)
-                    await asyncio.sleep(TICK_INTERVAL)
+                    await feed.wait_for_price(symbol, timeout=TICK_INTERVAL)
                     continue
+
+                # Apply any WS order status updates on top of the polled list
+                ws_updates = feed.pop_order_updates()
+                if ws_updates:
+                    for order in all_orders:
+                        update = ws_updates.get(_order_id(order))
+                        if update:
+                            order["status"] = update.get("status", order.get("status"))
+                            order["filled_quantity"] = update.get(
+                                "filled_quantity", order.get("filled_quantity")
+                            )
 
                 open_count = sum(1 for o in all_orders if o.get("status") in _OPEN_STATUSES)
 
@@ -493,7 +538,7 @@ async def _bot_tick(session_id: UUID, user_id: str) -> None:
         except Exception:
             logger.exception("Unexpected error in bot tick  user=%s", user_id)
 
-        await asyncio.sleep(TICK_INTERVAL)
+        await feed.wait_for_price(symbol, timeout=TICK_INTERVAL)
 
 
 # ── public API (used by routers and main) ─────────────────────────────────────
