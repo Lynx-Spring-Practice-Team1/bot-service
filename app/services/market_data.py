@@ -106,6 +106,18 @@ class _Cache:
         self._prices.pop(symbol, None)
         self._halt.pop(symbol, None)
 
+    def get_last_price(self, symbol: str) -> float | None:
+        """Return the most recent cached price for the symbol, or None.
+
+        Used by admin endpoints that need a mark price without driving a
+        fresh broker fetch. Returns None when the cache hasn't seen this
+        symbol or the prices list is empty.
+        """
+        cached = self._prices.get(symbol)
+        if not cached or not cached[1]:
+            return None
+        return float(cached[1][-1])
+
 
 # module-level singleton shared by all bot tasks
 price_cache = _Cache()
