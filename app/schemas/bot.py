@@ -61,3 +61,23 @@ class BotPerformanceOut(BaseModel):
     closed_trades: int
     total_pnl: float
     trades: list[TradeOut]
+
+
+class BotSessionOut(BaseModel):
+    session_id: UUID
+    symbol: str
+    status: str
+    daily_pnl: float = 0.0
+    trades_count: int = 0
+    win_rate: float = 0.0
+    position_side: Optional[str] = None
+    entry_price: Optional[float] = None
+    entry_quantity: Optional[float] = None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class BotSessionListResponse(BaseModel):
+    items: list[BotSessionOut]
